@@ -2,6 +2,8 @@
 
 """Input/output checkpointing."""
 
+from collections import OrderedDict
+import re
 import os
 import random
 import sys
@@ -93,7 +95,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
     # data parallel rank.
-    if not pipeline_parallel:
+    if False: ## not pipeline_parallel:
         common_path = os.path.join(checkpoints_path, directory,
                             f'mp_rank_{tensor_rank:02d}')
     else:
@@ -351,7 +353,8 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     " checkpoint version {}".format(checkpoint_version))
 
 
-def _load_base_checkpoint(load_dir, rank0=False):
+def _load_base_checkpoint(load_dir, rank0=False,
+                          pipeline_parallel=None, tensor_rank=None, pipeline_rank=None):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -377,11 +380,12 @@ def _load_base_checkpoint(load_dir, rank0=False):
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
     else:
-        checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+        checkpoint_name = get_checkpoint_name(load_dir, iteration, release,
+                                              pipeline_parallel, tensor_rank, pipeline_rank)
         if release:
-            print_rank_0(f' loading release checkpoint from {load_dir}')
+            print_rank_0(f' loading release checkpoint from {load_dir}: {checkpoint_name}')
         else:
-            print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
+            print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}: {checkpoint_name}')
 
     # Load the checkpoint.
     try:
@@ -486,6 +490,267 @@ def load_args_from_checkpoint(args, load_arg='load'):
     return args, checkpoint_args
 
 
+def _print_tensors(state_dict, current_keys=None):
+    if isinstance(state_dict, (dict, OrderedDict)):
+        for key, value in state_dict.items():
+            if current_keys is None:
+                keys = [key]
+            else:
+                keys = [*current_keys, key]
+            _print_tensors(value, keys)
+    elif isinstance(state_dict, torch.Tensor):
+        print(f'{".".join(current_keys)}: {state_dict.shape}', flush=True)
+
+
+def _merge_tensor_model_parallel(state_dicts, current_keys=None):
+    if isinstance(state_dicts[0], (dict, OrderedDict)):
+        if isinstance(state_dicts[0], OrderedDict):
+            result_dict = OrderedDict()
+        else:
+            result_dict = dict()
+        for key, value in state_dicts[0].items():
+            if current_keys is None:
+                keys = [key]
+            else:
+                keys = [*current_keys, key]
+            result_dict[key] = _merge_tensor_model_parallel([state[key] for state in state_dicts], keys)
+        return result_dict
+    elif isinstance(state_dicts[0], torch.Tensor):
+        def do_merge(axis=-1):
+            if axis == -1:
+                for tensor in state_dicts[1:]:
+                    assert torch.allclose(state_dicts[0], tensor)
+                return state_dicts[0]
+            return torch.concat(state_dicts, axis=axis)
+
+        keys = '.'.join(current_keys)
+        if 'embeddings.weight' in keys:
+            return do_merge(axis=0)
+        if 'layernorm' in keys:
+            return do_merge(axis=-1)
+        if 'self_attention.query_key_value.weight' in keys:
+            return do_merge(axis=0)
+        if 'self_attention.dense.weight' in keys:
+            return do_merge(axis=1)
+        if 'mlp.dense_h' in keys and 'h.weight' in keys:
+            return do_merge(axis=0)
+        if 'mlp.dense' in keys and 'to_h.weight' in keys:
+            return do_merge(axis=1)
+        if 'output_layer.weight' in keys:
+            return do_merge(axis=0)
+        if 'model' in 'keys':
+            raise ValueError(f'Unknown keys: {keys}')
+        else:
+            return state_dicts[0]
+    else:
+        return state_dicts[0]
+
+
+def _split_tensor_model_parallel(state_dict, size, rank, current_keys=None):
+    if isinstance(state_dict, (dict, OrderedDict)):
+        if isinstance(state_dict, OrderedDict):
+            result_dict = OrderedDict()
+        else:
+            result_dict = dict()
+        for key, value in state_dict.items():
+            if current_keys is None:
+                keys = [key]
+            else:
+                keys = [*current_keys, key]
+            result_dict[key] = _split_tensor_model_parallel(value, size, rank, keys)
+        return result_dict
+    elif isinstance(state_dict, torch.Tensor):
+        def do_split(axis=-1):
+            if axis == -1:
+                return state_dict
+            shard_size = state_dict.shape[axis] // size
+            if axis == 0:
+                return state_dict[shard_size * rank : shard_size * (rank + 1), :]
+            else:
+                return state_dict[:, shard_size * rank : shard_size * (rank + 1)]
+
+        keys = '.'.join(current_keys)
+        if 'embeddings.weight' in keys:
+            return do_split(axis=0)
+        if 'layernorm' in keys:
+            return do_split(axis=-1)
+        if 'self_attention.query_key_value.weight' in keys:
+            return do_split(axis=0)
+        if 'self_attention.dense.weight' in keys:
+            return do_split(axis=1)
+        if 'mlp.dense_h' in keys and 'h.weight' in keys:
+            return do_split(axis=0)
+        if 'mlp.dense' in keys and 'to_h.weight' in keys:
+            return do_split(axis=1)
+        if 'output_layer.weight' in keys:
+            return do_split(axis=0)
+        if 'model' in 'keys':
+            raise ValueError(f'Unknown keys: {keys}')
+        else:
+            return state_dict
+    else:
+        return state_dict
+
+def _merge_pipeline_model_parallel(state_dicts, result_dict=None, index=0, current_keys=None):
+    if isinstance(state_dicts, list):
+        result_dict = dict()
+        for index, state_dict in enumerate(state_dicts):
+            _merge_pipeline_model_parallel(state_dict, result_dict, index=index)
+        return result_dict
+    else:
+        pattern = r'layers\.([\d])+\.'
+        layers = dict()
+        for key, value in state_dicts.items():
+            if isinstance(value, (dict, OrderedDict)):
+                if key not in result_dict:
+                    if isinstance(value, OrderedDict):
+                        result_dict[key] = OrderedDict()
+                    else:
+                        result_dict[key] = dict()
+                if current_keys is None:
+                    keys = [key]
+                else:
+                    keys = [*current_keys, key]
+                _merge_pipeline_model_parallel(value, result_dict[key], index=index, current_keys=keys)
+            else:
+                matched = re.match(pattern, key)
+                if matched is not None:
+                    layer = int(matched.group(1))
+                    if layer not in layers:
+                        layers[layer] = []
+                    layers[layer].append((key, value))
+                else:
+                    if key != 'scale' and isinstance(value, torch.Tensor):
+                        assert key not in result_dict, f"Key {key} occurs more than twice"
+                    result_dict[key] = value
+        for idx in range(len(layers)):
+            for key, value in layers[idx]:
+                new_key = re.sub(pattern, f'layers.{index * len(layers) + idx}.', key)
+                result_dict[new_key] = value
+
+def _split_pipeline_model_parallel(state_dict, size, rank, current_keys=None):
+    raise NotImplementedError("TODO(tao): split pipeline parallelism is not supported.")
+
+def _load_base_checkpoint_and_tensor_model_parallel_reshard(
+        load_dir,
+        tp_rank,
+        pp_rank,
+        tensor_model_parallel_size,
+        original_tensor_model_parallel_size):
+    """Load and reshard the state dict for given mp and pp.
+    """
+    if tensor_model_parallel_size < original_tensor_model_parallel_size:
+        assert original_tensor_model_parallel_size % tensor_model_parallel_size == 0
+        shard_per_rank = original_tensor_model_parallel_size // tensor_model_parallel_size
+        start_shard = shard_per_rank * tp_rank
+        tp_ranks = [start_shard + i for i in range(shard_per_rank)]
+    else:
+        assert tensor_model_parallel_size % original_tensor_model_parallel_size == 0
+        tp_ranks = [tp_rank // original_tensor_model_parallel_size]
+
+    state_dicts = []
+    for rank in tp_ranks:
+        state_dict, release = _load_base_checkpoint(
+            load_dir, rank0=False,
+            pipeline_parallel=True, tensor_rank=rank, pipeline_rank=pp_rank)
+        state_dicts.append(state_dict)
+    return _tensor_model_parallel_reshard(state_dicts, tp_rank, pp_rank,
+                                          tensor_model_parallel_size,
+                                          original_tensor_model_parallel_size)
+
+def _tensor_model_parallel_reshard(
+        state_dicts,
+        tp_rank,
+        pp_rank,
+        tensor_model_parallel_size,
+        original_tensor_model_parallel_size):
+    if tensor_model_parallel_size < original_tensor_model_parallel_size:
+        return _merge_tensor_model_parallel(state_dicts)
+    else:
+        size = tensor_model_parallel_size // original_tensor_model_parallel_size
+        rank = tp_rank % original_tensor_model_parallel_size
+        return _split_tensor_model_parallel(state_dicts[0], size, rank)
+
+def _load_base_checkpoint_and_pipeline_parallel_reshard(
+        load_dir,
+        tp_rank,
+        pp_rank,
+        pipeline_model_parallel_size,
+        original_pipeline_model_parallel_size):
+    """Load and reshard the state dict for given mp and pp.
+    """
+    if pipeline_model_parallel_size < original_pipeline_model_parallel_size:
+        assert original_pipeline_model_parallel_size % pipeline_model_parallel_size == 0
+        shard_per_rank = original_pipeline_model_parallel_size // pipeline_model_parallel_size
+        start_shard = shard_per_rank * pp_rank
+        pp_ranks = [start_shard + i for i in range(shard_per_rank)]
+    else:
+        assert pipeline_model_parallel_size % original_pipeline_model_parallel_size == 0
+        pp_ranks = [pp_rank // original_pipeline_model_parallel_size]
+
+    print_rank_0('pp_ranks = ', pp_ranks)
+    state_dicts = []
+    for rank in pp_ranks:
+        state_dict, release = _load_base_checkpoint(
+            load_dir, rank0=False,
+            pipeline_parallel=True, tensor_rank=tp_rank, pipeline_rank=rank)
+        state_dicts.append(state_dict)
+    return _pipeline_model_parallel_reshard(state_dicts, tp_rank, pp_rank,
+                                            pipeline_model_parallel_size,
+                                            original_pipeline_model_parallel_size)
+
+def _pipeline_model_parallel_reshard(
+        state_dicts,
+        tp_rank,
+        pp_rank,
+        pipeline_model_parallel_size,
+        original_pipeline_model_parallel_size):
+    if pipeline_model_parallel_size < original_pipeline_model_parallel_size:
+        print_rank_0('state_dicts = ', state_dicts)
+        return _merge_pipeline_model_parallel(state_dicts)
+    else:
+        size = pipeline_model_parallel_size // original_pipeline_model_parallel_size
+        rank = pp_rank % original_pipeline_model_parallel_size
+        return _split_pipeline_model_parallel(state_dicts[0], size, rank)
+    return result
+
+def _load_base_checkpoint_and_reshard(load_dir, rank0=False):
+    args = get_args()
+
+    # resolve previous parallism from checkpoint
+    if args.original_tensor_model_parallel_size == 0 or \
+            args.original_pipeline_model_parallel_size == 0:
+        state_dict, release = _load_base_checkpoint(load_dir, rank0=True)
+        if state_dict is None:
+            return None, None
+        args.original_tensor_model_parallel_size = state_dict['args'].tensor_model_parallel_size
+        args.original_pipeline_model_parallel_size = state_dict['args'].pipeline_model_parallel_size
+
+    reshard_tp = args.tensor_model_parallel_size != args.original_tensor_model_parallel_size
+    reshard_pp = args.pipeline_model_parallel_size != args.original_pipeline_model_parallel_size
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    if not reshard_tp and not reshard_pp:
+        return _load_base_checkpoint(load_dir, rank0=rank0)
+    if not reshard_tp and reshard_pp:
+        state_dict = _load_base_checkpoint_and_pipeline_parallel_reshard(
+            load_dir, tp_rank, pp_rank,
+            args.pipeline_model_parallel_size, args.original_pipeline_model_parallel_size)
+    if reshard_tp and not reshard_pp:
+        state_dict = _load_base_checkpoint_and_tensor_model_parallel_reshard(
+            load_dir, tp_rank, pp_rank,
+            args.tensor_model_parallel_size, args.original_tensor_model_parallel_size)
+    if reshard_tp and reshard_pp:
+        # first pp, then tp
+        # find involved tp
+        raise NotImplementedError("TODO(tao)")
+
+    # fixes args
+    state_dict['args'].tensor_model_parallel_size = args.tensor_model_parallel_size
+    state_dict['args'].pipeline_model_parallel_size = args.pipeline_model_parallel_size
+    return state_dict, False
+
+
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -497,7 +762,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     model = unwrap_model(model)
 
-    state_dict, release = _load_base_checkpoint(load_dir, rank0=False)
+    if args.resharding:
+        state_dict, release = _load_base_checkpoint_and_reshard(load_dir, rank0=False)
+    else:
+        state_dict, release = _load_base_checkpoint(load_dir, rank0=False)
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -572,7 +840,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 optim_checkpoint_name = \
                     get_distributed_optimizer_checkpoint_name(
                         model_checkpoint_name)
-                optimizer.load_parameter_state(optim_checkpoint_name)
+                optimizer.load_parameter_state(optim_checkpoint_name, args)
 
             # Load scheduler.
             if opt_param_scheduler is not None:

@@ -467,21 +467,26 @@ class TransformerLanguageModel(MegatronModule):
                 enc_hidden_states=None, output_enc_hidden=False):
 
         # Encoder embedding.
+        torch.cuda.nvtx.range_push("encoder embedding")
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:
             encoder_input = None
+        torch.cuda.nvtx.range_pop()
 
         # Retriever embedding.
+        torch.cuda.nvtx.range_push("retriever embedding")
         if self.add_retriever and self.pre_process:
             retriever_input = self.embedding(retriever_input_ids,
                                              retriever_position_ids,
                                              tokentype_ids=tokentype_ids)
         else:
             retriever_input = None
+        torch.cuda.nvtx.range_pop()
 
         # Rotary positional embeddings
+        torch.cuda.nvtx.range_push("positional embedding")
         rotary_pos_emb = None
         if self.use_rotary_position_embeddings:
             if inference_params is not None:
@@ -489,8 +494,10 @@ class TransformerLanguageModel(MegatronModule):
                     self.rotary_pos_emb(inference_params.max_sequence_len)
             else:
                 rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+        torch.cuda.nvtx.range_pop()
 
         # Run encoder.
+        torch.cuda.nvtx.range_push("encoder")
         if enc_hidden_states is None:
             if self.encoder is not None:
                 encoder_output = self.encoder(
@@ -504,11 +511,14 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder_hidden_state
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("poller")
         if self.post_process:
             if self.add_pooler:
                 pooled_output = self.pooler(encoder_output,
                                             pooling_sequence_index)
+        torch.cuda.nvtx.range_pop()
 
         # output_enc_hidden refers to when we just need the encoder's
         # output. For example, it is helpful to compute
@@ -520,13 +530,16 @@ class TransformerLanguageModel(MegatronModule):
                 return encoder_output
 
         # Decoder embedding.
+        torch.cuda.nvtx.range_push("decoder embedding")
         if self.pre_process:
             decoder_input = self.embedding(dec_input_ids,
                                            dec_position_ids)
         else:
             decoder_input = None
+        torch.cuda.nvtx.range_pop()
 
         # Run decoder.
+        torch.cuda.nvtx.range_push("decoder")
         decoder_output = self.decoder(
             decoder_input,
             dec_attn_mask,
@@ -534,6 +547,7 @@ class TransformerLanguageModel(MegatronModule):
             enc_dec_attn_mask=enc_dec_attn_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb)
+        torch.cuda.nvtx.range_pop()
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output

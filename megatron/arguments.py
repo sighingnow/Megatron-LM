@@ -35,6 +35,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_resharding_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -1216,5 +1217,19 @@ def _add_vision_args(parser):
                        help='teacher temperature')
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
+
+    return parser
+
+
+def _add_resharding_args(parser):
+    group = parser.add_argument_group(title="resharding")
+
+    # general vision arguements
+    group.add_argument('--resharding', default=False, action='store_true',
+                       help='do resharing or not')
+    group.add_argument('--original-tensor-model-parallel-size', type=int, default=0,
+                       help='Original tensor parallel size')
+    group.add_argument('--original-pipeline-model-parallel-size', type=int, default=0,
+                       help='Original pipeline parallel size')
 
     return parser

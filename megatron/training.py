@@ -21,6 +21,7 @@ from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
 from megatron import print_rank_0
+from megatron import print_rank_all
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
@@ -163,7 +164,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+        save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -270,6 +271,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    # Print module and named parameters:
+    # if mpu.get_data_parallel_rank() == 0:
+    rank = f'{mpu.get_data_parallel_rank()} - {mpu.get_tensor_model_parallel_rank()} - {mpu.get_pipeline_model_parallel_rank()}'
+    for model_module in model:
+        parameters = {}
+        for name, param in model_module.named_parameters():
+            parameters[name] = f'{param.dtype}, {param.shape}'
+        # print_rank_all(f'model_module (rank {rank}): {model_module}, parameters:', parameters)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
@@ -418,6 +428,7 @@ def train_step(forward_step_func, data_iterator,
         barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
     fwd_bwd_timers = timers if args.timing_log_level > 1 else None
+    torch.cuda.nvtx.range_push("forward_backward_func")
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -430,6 +441,7 @@ def train_step(forward_step_func, data_iterator,
         forward_only=False,
         timers=fwd_bwd_timers)
     timers('forward-backward').stop()
+    torch.cuda.nvtx.range_pop()
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:

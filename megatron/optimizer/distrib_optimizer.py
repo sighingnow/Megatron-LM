@@ -3,13 +3,15 @@
 """Megatron distributed optimizer."""
 
 
+from collections import OrderedDict
+
 from apex.optimizers import FusedAdam as Adam
 import math
 import torch
 
 from megatron import get_args
 from megatron import get_timers
-from megatron import print_rank_0
+from megatron import print_rank_0, print_rank_all, print_dp_rank_0, print_dp_rank_all
 from megatron.core import mpu, tensor_parallel
 from megatron.model.module import param_is_not_shared
 
@@ -29,6 +31,8 @@ class Range:
         return Range(start, start + self.size)
     def __str__(self):
         return "%d,%d [%d]" % (self.start, self.end, self.size)
+    def __repr__(self):
+        return str(self)
     def __len__(self):
         return self.end - self.start
 
@@ -96,7 +100,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param, param_world_indexes in param_world_index_map.items():
 
             # Param range.
-            param_world_start, param_world_end = param_world_indexes
+            param_name, param_world_start, param_world_end = param_world_indexes
             param_local_start = max(
                 0,
                 param_world_start - gbuf_world_range.start)
@@ -114,11 +118,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range_map[param] = {
                     "gbuf_world" : param_world_range,
                     "gbuf_local" : param_local_range,
+                    'param_name': param_name,
                     "param" : sub_param_range,
                 }
 
         return param_range_map
 
+    @classmethod
+    def build_model_gbuf_param_global_range_map(cls, model, dtype):
+        # Param range map.
+        param_world_index_map = model._grad_buffer_param_index_map[dtype]
+        param_range_map = []
+        for param, param_world_indexes in param_world_index_map.items():
+            # Param range.
+            param_name, param_world_start, param_world_end = param_world_indexes
+            param_range_map.append({
+                'param_name': param_name,
+                'param_shape': param.shape,
+                'param_dtype': param.dtype,
+                "param" : Range(param_world_start, param_world_end),
+            })
+        param_range_map.sort(key=lambda x: x['param'].start)
+        return param_range_map
 
     @classmethod
     def build_model_gbuf_range(cls, model, dtype):
@@ -170,6 +191,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     @classmethod
+    def build_model_gbuf_global_range(cls, model, dtype):
+        # Get each param's ranges.
+        param_range_map = cls.build_model_gbuf_param_global_range_map(
+            model, dtype)
+        # Group into dict.
+        data = {
+            "param_map" : param_range_map,
+        }
+        return data
+
+    @classmethod
     def build_model_gbuf_range_map(cls, model):
         """
         Create param-to-grad-buffer mappings, for grad buffer data types
@@ -180,6 +212,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype in model._grad_buffers
         }
 
+    @classmethod
+    def build_model_gbuf_global_range_map(cls, model):
+        """
+        Create param-to-grad-buffer mappings, for grad buffer data types
+        within a specific virtual model.
+        """
+        return {
+            dtype : cls.build_model_gbuf_global_range(model, dtype)
+            for dtype in model._grad_buffers
+        }
 
     @classmethod
     def build_model_param_gbuf_map(cls, model_gbuf_ranges):
@@ -334,7 +376,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     'torch.cuda.FloatTensor,  '
                                     'torch.cuda.HalfTensor, or '
                                     'torch.cuda.BFloat16Tensor. '
-                                    'Received {}'.format(param.type()))
+                                    'Received {}'.format(model_param.type()))
 
             # Update optimizer's params.
             group_range["orig_group"]["params"] = [
@@ -379,6 +421,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.model_gbuf_ranges = []
         for model_index, model in enumerate(self.models):
             self.model_gbuf_ranges.append(self.build_model_gbuf_range_map(model))
+        self.model_gbuf_global_ranges = []
+        for model_index, model in enumerate(self.models):
+            self.model_gbuf_global_ranges.append(self.build_model_gbuf_global_range_map(model))
         self.model_param_gbuf_map = \
             self.build_model_param_gbuf_map(self.model_gbuf_ranges)
 
@@ -386,7 +431,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.model_param_group_index_map, self.opt_group_ranges = \
             self.build_optimizer_group_ranges(self.optimizer.param_groups,
                                               self.model_gbuf_ranges)
-        
+
+        model_gbuf_ranges = []
+        for model_index, model_gbuf_range_map in enumerate(self.model_gbuf_ranges):
+            model_gbuf_range_map_dict = {}
+            for dtype, gbuf_range_map in model_gbuf_range_map.items():
+                for key, value in gbuf_range_map.items():
+                    if key == "param_map":
+                        model_gbuf_range_map_dict[key] = {f'Tensor<{param.shape}({param.dtype})>': param_range_map for param, param_range_map in value.items()}
+                    else:
+                        model_gbuf_range_map_dict[key] = value
+            model_gbuf_ranges.append(model_gbuf_range_map_dict)
+        print_rank_all('model_gbuf_global_ranges: ', self.model_gbuf_global_ranges)
+
         # Allocate main param shards.
         (
             self.model_float16_groups,
@@ -660,8 +717,283 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if data_parallel_rank == 0:
             torch.save(state, filename)
 
+    def _merge_tensor_model_parallel(self, parameter_states, size, current_keys=None):
+        if isinstance(parameter_states[0], (dict, OrderedDict)):
+            if isinstance(parameter_states[0], OrderedDict):
+                result_dict = OrderedDict()
+            else:
+                result_dict = dict()
+            for key, value in parameter_states[0].items():
+                if current_keys is None:
+                    keys = [key]
+                else:
+                    keys = [*current_keys, key]
+                result_dict[key] = self._merge_tensor_model_parallel([state[key] for state in parameter_states], size, keys)
+            return result_dict
+        elif isinstance(parameter_states[0], torch.Tensor):
+            def do_merge(param, next_offset, axis=-1):
+                shape = param['param_shape']
+                length = param['param'].end - param['param'].start
+                if axis == -1:
+                    chunks = [state[next_offset : next_offset + length].reshape(shape) for state in parameter_states]
+                    for tensor in chunks:
+                        assert torch.allclose(chunks[0], tensor)
+                    return chunks[0].reshape(-1), next_offset + length
+                else:
+                    length //= size
+                    if axis == 0:
+                        shape = torch.Size((shape[0] // size, shape[1]))
+                    else:
+                        shape = torch.Size((shape[0], shape[1] // size))
+                    chunks = [state[next_offset : next_offset + length].reshape(shape) for state in parameter_states]
+                    return torch.concat(chunks, axis=axis).reshape(-1), next_offset + length
 
-    def load_parameter_state(self, filename):
+            tensors, next_offset = [], 0
+            for param in self.model_gbuf_global_ranges[0][torch.float32]['param_map']:  # FIXME
+                if 'embeddings.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'layernorm' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=-1)
+                    tensors.append(tensor)
+                elif 'self_attention.query_key_value.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'self_attention.dense.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=1)
+                    tensors.append(tensor)
+                elif 'mlp.dense_h' in param['param_name'] and 'h.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'mlp.dense' in param['param_name'] and 'to_h.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=1)
+                    tensors.append(tensor)
+                elif 'output_layer.weight' in param['param_name']:
+                    tensor, next_offset = do_merge(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                else:
+                    raise ValueError(f'Unknown param: {param}')
+            return torch.concat(tensors, axis=0)
+        else:
+            raise ValueError(f'Unknown parameter_states: {parameter_states}')
+
+    def _split_tensor_model_parallel(self, parameter_state, size, rank, current_keys=None):
+        if isinstance(parameter_state, (dict, OrderedDict)):
+            if isinstance(parameter_state, OrderedDict):
+                result_dict = OrderedDict()
+            else:
+                result_dict = dict()
+            for key, value in parameter_state.items():
+                if current_keys is None:
+                    keys = [key]
+                else:
+                    keys = [*current_keys, key]
+                result_dict[key] = self._split_tensor_model_parallel(value, size, rank, keys)
+            return result_dict
+        elif isinstance(parameter_state, torch.Tensor):
+            def do_split(param, next_offset, axis=-1):
+                shape = param['param_shape']
+                length = param['param'].end - param['param'].start
+
+                if axis == -1:
+                    chunk = parameter_state[next_offset : next_offset + length]
+                    return chunk, next_offset + length
+                else:
+                    length *= size
+                    if axis == 0:
+                        shape = torch.Size((shape[0] * size, shape[1]))
+                    else:
+                        shape = torch.Size((shape[0], shape[1] * size))
+                    chunk = parameter_state[next_offset : next_offset + length].reshape(shape)
+                    shard_size = chunk.shape[axis] // size
+                    if axis == 0:
+                        return chunk[shard_size * rank : shard_size * (rank + 1), :].reshape(-1), next_offset + length
+                    else:
+                        return chunk[:, shard_size * rank : shard_size * (rank + 1)].reshape(-1), next_offset + length
+
+            tensors, next_offset = [], 0
+            for param in self.model_gbuf_global_ranges[0][torch.float32]['param_map']:  # FIXME
+                if 'embeddings.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'layernorm' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=-1)
+                    tensors.append(tensor)
+                elif 'self_attention.query_key_value.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'self_attention.dense.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=1)
+                    tensors.append(tensor)
+                elif 'mlp.dense_h' in param['param_name'] and 'h.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                elif 'mlp.dense' in param['param_name'] and 'to_h.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=1)
+                    tensors.append(tensor)
+                elif 'output_layer.weight' in param['param_name']:
+                    tensor, next_offset = do_split(param, next_offset, axis=0)
+                    tensors.append(tensor)
+                else:
+                    raise ValueError(f'Unknown param: {param}')
+            return torch.concat(tensors, axis=0)
+        else:
+            raise ValueError(f'Unknown parameter_state: {parameter_state}')
+
+    def _merge_pipeline_model_parallel(self, parameter_states, size, current_keys=None):
+        if isinstance(parameter_states[0], (dict, OrderedDict)):
+            if isinstance(parameter_states[0], OrderedDict):
+                result_dict = OrderedDict()
+            else:
+                result_dict = dict()
+            for key, value in parameter_states[0].items():
+                if current_keys is None:
+                    keys = [key]
+                else:
+                    keys = [*current_keys, key]
+                result_dict[key] = self._merge_pipeline_model_parallel([state[key] for state in parameter_states], size, keys)
+            return result_dict
+        if isinstance(parameter_states, list):
+            # assume x2 style merge
+            length, tensor_length = 0, 0
+            for param in self.model_gbuf_global_ranges[0][torch.float32]['param_map']:
+                length += param['param'].end - param['param'].start
+            for tensor in parameter_states:
+                tensor_length += tensor.numel()
+            assert length == tensor_length
+            return torch.concat(list(reversed(parameter_states)), axis=0)
+
+    def _split_pipeline_model_parallel(self, parameter_state, size, rank, current_keys=None):
+        raise NotImplementedError("TODO(tao): split pipeline parallelism is not supported.")
+
+    def _load_parameter_state_and_tensor_model_parallel_reshard(
+            self,
+            args,
+            tp_rank,
+            pp_rank,
+            tensor_model_parallel_size,
+            original_tensor_model_parallel_size):
+        """Load and reshard the state dict for given mp and pp.
+        """
+        if tensor_model_parallel_size < original_tensor_model_parallel_size:
+            assert original_tensor_model_parallel_size % tensor_model_parallel_size == 0
+            shard_per_rank = original_tensor_model_parallel_size // tensor_model_parallel_size
+            start_shard = shard_per_rank * tp_rank
+            tp_ranks = [start_shard + i for i in range(shard_per_rank)]
+        else:
+            assert tensor_model_parallel_size % original_tensor_model_parallel_size == 0
+            tp_ranks = [tp_rank // original_tensor_model_parallel_size]
+
+        from ..checkpointing import get_checkpoint_tracker_filename
+        from ..checkpointing import read_metadata
+        from ..checkpointing import get_checkpoint_name
+        from ..checkpointing import get_distributed_optimizer_checkpoint_name
+
+        load_dir = getattr(args, 'load')
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        iteration, release = read_metadata(tracker_filename)
+
+        parameter_states = []
+        for rank in tp_ranks:
+            checkpoint_name = get_checkpoint_name(
+                load_dir, iteration, release,
+                pipeline_parallel=True, tensor_rank=rank, pipeline_rank=pp_rank)
+            optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
+            parameter_states.append(torch.load(optim_checkpoint_name))
+        return self._tensor_model_parallel_reshard(parameter_states, tp_rank, pp_rank,
+                                                   tensor_model_parallel_size,
+                                                   original_tensor_model_parallel_size)
+
+    def _tensor_model_parallel_reshard(
+            self,
+            parameter_states,
+            tp_rank,
+            pp_rank,
+            tensor_model_parallel_size,
+            original_tensor_model_parallel_size):
+        if tensor_model_parallel_size < original_tensor_model_parallel_size:
+            size = original_tensor_model_parallel_size // tensor_model_parallel_size
+            return self._merge_tensor_model_parallel(parameter_states, size)
+        else:
+            size = tensor_model_parallel_size // original_tensor_model_parallel_size
+            rank = tp_rank % original_tensor_model_parallel_size
+            return self._split_tensor_model_parallel(parameter_states[0], size, rank)
+
+    def _load_parameter_state_and_pipeline_model_parallel_reshard(
+            self,
+            args,
+            tp_rank,
+            pp_rank,
+            pipeline_model_parallel_size,
+            original_pipeline_model_parallel_size):
+        """Load and reshard the state dict for given mp and pp.
+        """
+        if pipeline_model_parallel_size < original_pipeline_model_parallel_size:
+            assert original_pipeline_model_parallel_size % pipeline_model_parallel_size == 0
+            shard_per_rank = original_pipeline_model_parallel_size // pipeline_model_parallel_size
+            start_shard = shard_per_rank * pp_rank
+            pp_ranks = [start_shard + i for i in range(shard_per_rank)]
+        else:
+            assert pipeline_model_parallel_size % original_pipeline_model_parallel_size == 0
+            pp_ranks = [pp_rank // original_pipeline_model_parallel_size]
+
+        from ..checkpointing import get_checkpoint_tracker_filename
+        from ..checkpointing import read_metadata
+        from ..checkpointing import get_checkpoint_name
+        from ..checkpointing import get_distributed_optimizer_checkpoint_name
+
+        load_dir = getattr(args, 'load')
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        iteration, release = read_metadata(tracker_filename)
+
+        parameter_states = []
+        for rank in pp_ranks:
+            checkpoint_name = get_checkpoint_name(
+                load_dir, iteration, release,
+                pipeline_parallel=True, tensor_rank=tp_rank, pipeline_rank=rank)
+            optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
+            parameter_states.append(torch.load(optim_checkpoint_name))
+        return self._pipeline_model_parallel_reshard(parameter_states, tp_rank, pp_rank,
+                                                     pipeline_model_parallel_size,
+                                                     original_pipeline_model_parallel_size)
+
+    def _pipeline_model_parallel_reshard(
+            self,
+            parameter_states,
+            tp_rank,
+            pp_rank,
+            pipeline_model_parallel_size,
+            original_pipeline_model_parallel_size):
+        if pipeline_model_parallel_size < original_pipeline_model_parallel_size:
+            size = original_pipeline_model_parallel_size // pipeline_model_parallel_size
+            return self._merge_pipeline_model_parallel(parameter_states, size)
+        else:
+            size = pipeline_model_parallel_size // original_pipeline_model_parallel_size
+            rank = pp_rank % original_pipeline_model_parallel_size
+            return self._split_pipeline_model_parallel(parameter_states[0], size, rank)
+
+    def load_parameter_state_and_reshard(self, filename, args):
+        reshard_tp = args.tensor_model_parallel_size != args.original_tensor_model_parallel_size
+        reshard_pp = args.pipeline_model_parallel_size != args.original_pipeline_model_parallel_size
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+
+        if not reshard_tp and not reshard_pp:
+            return torch.load(filename)
+        if not reshard_tp and reshard_pp:
+            return self._load_parameter_state_and_pipeline_model_parallel_reshard(
+                args, tp_rank, pp_rank,
+                args.pipeline_model_parallel_size, args.original_pipeline_model_parallel_size)
+        if reshard_tp and not reshard_pp:
+            return self._load_parameter_state_and_tensor_model_parallel_reshard(
+                args, tp_rank, pp_rank,
+                args.tensor_model_parallel_size, args.original_tensor_model_parallel_size)
+        if reshard_tp and reshard_pp:
+            # first pp, then tp
+            # find involved tp
+            raise NotImplementedError("TODO(tao)")
+
+    def load_parameter_state(self, filename, args=None):
         """Load parameter state (i.e., parameter & optimizer tensors).
 
         This method performs the reverse of save_parameter_state():
@@ -681,7 +1013,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Load on DP rank 0.
         if data_parallel_rank == 0:
-            loaded_state = torch.load(filename)
+            if args is not None and args.resharding:
+                loaded_state = self.load_parameter_state_and_reshard(filename, args)
+            else:
+                loaded_state = torch.load(filename)
 
         # Scatter tensors to all DP ranks.
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
@@ -891,7 +1226,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Copy from param buffer to each param.
         for model_id, model in enumerate(self.models):
             for dtype, param_map in model._grad_buffer_param_index_map.items():
-                for param, (buf_start, buf_end) in param_map.items():
+                for param, (name, buf_start, buf_end) in param_map.items():
                     param_buf = self.param_buffers[model_id][dtype]
                     param_buf_shard = param_buf[buf_start:buf_end]
                     param.view(-1).detach().copy_(param_buf_shard)

@@ -38,6 +38,11 @@ class MemoryBuffer:
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
 
+    def __str__(self):
+        return f'MemoryBuffer <{self.numel} (padding: {self.numel_padded}), dtype={self.dtype}>'
+
+    def __repr__(self) -> str:
+        return str(self)
 
 
 class DistributedDataParallelBase(MegatronModule, ABC):
@@ -143,7 +148,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
-            for param in self.module.parameters():
+            for name, param in self.module.named_parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] -= param.data.nelement()
@@ -152,6 +157,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     if dtype not in self._grad_buffer_param_index_map:
                         self._grad_buffer_param_index_map[dtype] = {}
                     self._grad_buffer_param_index_map[dtype][param] = (
+                        name,
                         type_num_elements[dtype],
                         type_num_elements[dtype] + param.data.nelement(),
                     )
@@ -169,6 +175,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
                     grad_acc.register_hook(self._make_param_hook(param))
                     self.grad_accs.append(grad_acc)
+        print('self._grad_buffers on (data, tensor, pipeline) model parallel rank ({}, {}, {}): {}'.format(
+            mpu.get_data_parallel_rank(),
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_pipeline_model_parallel_rank(),
+            self._grad_buffers))
 
 
     def _make_param_hook(self, param):

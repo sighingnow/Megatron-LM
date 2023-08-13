@@ -192,13 +192,43 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
-def print_rank_0(message):
+def print_rank_0(*message):
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
-            print(message, flush=True)
+            print(*message, flush=True)
     else:
-        print(message, flush=True)
+        print(*message, flush=True)
+
+def print_rank_all(*message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        dp_rank = mpu.get_data_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        print(f'[{dp_rank}:{tp_rank}:{pp_rank}]', *message, flush=True)
+    else:
+        print(*message, flush=True)
+
+def print_dp_rank_0(*message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if mpu.get_data_parallel_rank() == 0:
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            print(f'[{tp_rank}:{pp_rank}]', *message, flush=True)
+    else:
+        print(*message, flush=True)
+
+def print_dp_rank_all(*message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if mpu.get_tensor_model_parallel_rank() == 0 and \
+                mpu.get_pipeline_model_parallel_rank() == 0:
+            dp_rank = mpu.get_data_parallel_rank()
+            print(f'[{dp_rank}]', *message, flush=True)
+    else:
+        print(*message, flush=True)
 
 def is_last_rank():
     return torch.distributed.get_rank() == (

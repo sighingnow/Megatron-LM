@@ -1,12 +1,14 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
+from megatron import print_rank_0
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
@@ -118,10 +120,13 @@ def get_forward_backward_func():
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            print_rank_0('forward_backward_func: forward_backward_pipelining_with_interleaving')
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
+            print_rank_0('forward_backward_func: forward_backward_pipelining_without_interleaving')
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
+        print_rank_0('forward_backward_func: forward_backward_no_pipelining')
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
 
@@ -201,6 +206,7 @@ def forward_step(forward_step_func,
     Returns output tensor."""
     if timers is not None:
         timers('forward-compute', log_level=2).start()
+    torch.cuda.nvtx.range_push("forward_compute")
 
     unwrap_output_tensor = False
     if not isinstance(input_tensor, list):
@@ -215,8 +221,11 @@ def forward_step(forward_step_func,
     else:
         context_manager = contextlib.nullcontext()
     with context_manager:
+        torch.cuda.nvtx.range_push("forward_step_func")
         output_tensor, loss_func = forward_step_func(data_iterator, model)
+        torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("compute_loss_func")
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
             output_tensor = loss_func(output_tensor)
@@ -226,9 +235,11 @@ def forward_step(forward_step_func,
         else:
             data = loss_func(output_tensor, non_loss_data=True)
             forward_data_store.append(data)
+    torch.cuda.nvtx.range_pop()
 
     if timers is not None:
         timers('forward-compute').stop()
+    torch.cuda.nvtx.range_pop()
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
@@ -259,6 +270,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
 
     if timers is not None:
         timers('backward-compute', log_level=2).start()
+    torch.cuda.nvtx.range_push("backward_compute")
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -277,11 +289,13 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     # Backward pass.
     if output_tensor_grad[0] is None and grad_scaler is not None:
         output_tensor = grad_scaler(output_tensor[0])
-    
+
+    torch.cuda.nvtx.range_push("torch.autograd.backward")
     if deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
         torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    torch.cuda.nvtx.range_pop()
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -295,6 +309,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
 
     # Handle single skip connection if it exists (encoder_hidden_state in
     # model with encoder and decoder).
+    torch.cuda.nvtx.range_push("grad_accumulate")
     if parallel_state.get_pipeline_model_parallel_world_size() > 1 and \
             parallel_state.is_pipeline_stage_after_split() and \
             model_type == ModelType.encoder_and_decoder:
@@ -302,9 +317,11 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
             input_tensor_grad[-1].add_(output_tensor_grad[1])
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
+    torch.cuda.nvtx.range_pop()
 
     if timers is not None:
         timers('backward-compute').stop()
+    torch.cuda.nvtx.range_pop()
 
     return input_tensor_grad
 
