@@ -688,7 +688,6 @@ def _load_base_checkpoint_and_pipeline_parallel_reshard(
         assert pipeline_model_parallel_size % original_pipeline_model_parallel_size == 0
         pp_ranks = [pp_rank // original_pipeline_model_parallel_size]
 
-    print_rank_0('pp_ranks = ', pp_ranks)
     state_dicts = []
     for rank in pp_ranks:
         state_dict, release = _load_base_checkpoint(
@@ -706,7 +705,6 @@ def _pipeline_model_parallel_reshard(
         pipeline_model_parallel_size,
         original_pipeline_model_parallel_size):
     if pipeline_model_parallel_size < original_pipeline_model_parallel_size:
-        print_rank_0('state_dicts = ', state_dicts)
         return _merge_pipeline_model_parallel(state_dicts)
     else:
         size = pipeline_model_parallel_size // original_pipeline_model_parallel_size
