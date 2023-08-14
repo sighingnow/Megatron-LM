@@ -713,6 +713,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 dtype_state[dtype] = world_tensors
             state[model_idx] = dtype_state
 
+        if data_parallel_rank == 0:
+            state['ranges'] = self.model_gbuf_global_ranges
+
         # Save param state.
         if data_parallel_rank == 0:
             torch.save(state, filename)
