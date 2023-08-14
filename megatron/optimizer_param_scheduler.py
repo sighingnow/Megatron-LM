@@ -156,6 +156,9 @@ class OptimizerParamScheduler(object):
             if cls_value != sd_value:
                 print_rank_0(f' > warning: OptimizerParamScheduler: class input value {cls_value} and checkpoint' \
                 f'value {sd_value} for {name} do not match')
+                sd_value = cls_value  # use the class value, as it is newer, the root cause of this
+                                      # issue is we don't specify `lr_decay_iters` and use different
+                                      # `train_iters` when generate and reload the checkpoint.
         print_rank_0(' > using checkpoint value {} for {}'.format(sd_value,
                                                                   name))
         return sd_value
