@@ -106,6 +106,31 @@ class Encoder(object):
         return ids, lens, len(json_line)
 
 
+    def encode_text(self, text):
+        ids = {}
+        lens = {}
+        for key in self.args.json_keys[0:1]:  # use the first as the default key
+            if not text: # skip empty lines
+                continue
+            if isinstance(text, list):
+                sentences = text
+            else:
+                sentences = [text]
+            doc_ids = []
+            sentence_lens = []
+            for sentence in sentences:
+                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                if len(sentence_ids) > 0:
+                    doc_ids.extend(sentence_ids)
+                    sentence_lens.append(len(sentence_ids))
+            if len(doc_ids) > 0 and self.args.append_eod:
+                doc_ids.append(Encoder.tokenizer.eod)
+                sentence_lens[-1] += 1
+            ids[key] = doc_ids
+            lens[key] = sentence_lens
+        return ids, lens, len(text)
+
+
 class Partition(object):
     def __init__(self, args, workers):
         self.args = args
@@ -141,6 +166,14 @@ class Partition(object):
         fout.close()
 
 
+    def process_text_file(self, file_name):
+        input_file_name, output_prefix = file_name
+        if input_file_name.endswith('json') or input_file_name.endswith('jsonl'):
+            self.process_json_file(file_name)
+        else:
+            self.process_plaintext_file(file_name)
+
+
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
@@ -169,6 +202,48 @@ class Partition(object):
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
             )
+
+        startup_end = time.time()
+        proc_start = time.time()
+        total_bytes_processed = 0
+        print("Time to startup:", startup_end - startup_start)
+        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+            total_bytes_processed += bytes_processed
+            for key in doc.keys():
+                builders[key].add_doc(doc[key], sentence_lens[key])
+            self.print_processing_stats(i, proc_start, total_bytes_processed)
+
+        fin.close()
+        builders[key].finalize(output_idx_files[key])
+
+
+    def process_plaintext_file(self, file_name):
+        input_file_name, output_prefix = file_name
+        print("Opening", input_file_name)
+        fin = open(input_file_name, 'r', encoding='utf-8')
+
+        startup_start = time.time()
+        encoder = Encoder(self.args)
+        tokenizer = build_tokenizer(self.args)
+        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
+        encoded_docs = pool.imap(encoder.encode_text, fin, 32)
+
+        level = "document"
+        if self.args.split_sentences:
+            level = "sentence"
+
+        output_bin_files = {}
+        output_idx_files = {}
+        builders = {}
+
+        for key in self.args.json_keys:
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
+                                                          key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
+                                                          key, level)
+            builders[key] = indexed_dataset.make_builder(output_bin_files[key],
+                                                   impl=self.args.dataset_impl,
+                                                   vocab_size=tokenizer.vocab_size)
 
         startup_end = time.time()
         proc_start = time.time()
@@ -363,7 +438,7 @@ def main():
     processes = []
     input_key = 'sentence_split' if args.split_sentences else 'partition'
     for name in in_ss_out_names:
-        p = multiprocessing.Process(target=partition.process_json_file,
+        p = multiprocessing.Process(target=partition.process_text_file,
                                     args=((name[input_key], name['output_prefix']),))
         p.start()
         processes.append(p)
