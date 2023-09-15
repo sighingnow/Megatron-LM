@@ -1020,6 +1020,10 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--pipeline-eager', action='store_true',
+                       help="Pipeline with eager 1F1B scheduling.")
+    group.add_argument('--pipeline-no-flushes', action='store_true',
+                       help='Pipeline without flushes.')
     group.add_argument('--overlap-p2p-communication',
                        action='store_true',
                        help='overlap pipeline parallel communication with forward and backward chunks',

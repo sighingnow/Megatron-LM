@@ -11,6 +11,7 @@ import torch
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
+from megatron.core import parallel_state
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 
@@ -192,6 +193,97 @@ class MegatronOptimizer(ABC):
         pass
 
 
+    def allreduce_word_embedding_grads(self, args):
+        """
+        All-reduce word embedding grads.
+
+        Reduce grads across first and last stages to ensure that word_embeddings
+        parameters stay in sync. This should only run for models that support
+        pipelined model parallelism (BERT and GPT-2).
+        """
+
+        if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
+                mpu.get_pipeline_model_parallel_world_size() > 1:
+            if mpu.is_pipeline_first_stage(ignore_virtual=True):
+                unwrapped_model = self.models[0]
+            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
+                unwrapped_model = self.models[-1]
+            else:  # We do not support the interleaved schedule for T5 yet.
+                unwrapped_model = self.models[0]
+            unwrapped_model = unwrap_model(unwrapped_model)
+
+            if unwrapped_model.share_embeddings_and_output_weights:
+                weight = unwrapped_model.shared_embedding_or_output_weight()
+                grad = weight.main_grad
+                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+
+
+    def allreduce_position_embedding_grads(self, args):
+        """
+        All-reduce position_embeddings grad across first (encoder) and
+        split (decoder) stages to ensure that position embeddings parameters
+        stay in sync. This should only run for T5 models with pipeline
+        parallelism.
+        """
+        if mpu.is_rank_in_position_embedding_group() and \
+                mpu.get_pipeline_model_parallel_world_size() > 1 and \
+                args.pipeline_model_parallel_split_rank is not None:
+            unwrapped_model = self.models[0]
+            unwrapped_model = unwrap_model(unwrapped_model)
+            grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+            torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+
+
+    def allreduce_embedding_grads(self, args):
+        """All-reduce both word and position embeddings."""
+        self.allreduce_word_embedding_grads(args)
+        self.allreduce_position_embedding_grads(args)
+
+
+    def allreduce_layernorm_grads(self, args):
+        """All-reduce layernorm grads (for sequence parallelism)."""
+
+        # All-reduce layernorm parameters across model parallel nodes
+        # when sequence parallelism is used
+        if mpu.get_tensor_model_parallel_world_size() > 1 and \
+                args.sequence_parallel:
+            grads = []
+            for model_module in self.models:
+                unwrapped_model = unwrap_model(model_module)
+                for param in unwrapped_model.parameters():
+                    if getattr(param, 'sequence_parallel', False):
+                        grad = param.main_grad
+                        grads.append(grad.data)
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=mpu.get_tensor_model_parallel_group())
+            for buf, synced in zip(grads, _unflatten_dense_tensors(
+                    coalesced, grads)):
+                buf.copy_(synced)
+
+    def reduce_model_grads(self, args, timers):
+        """All-reduce all grads, and all-reduce embeddings."""
+
+        # All-reduce.
+        timers('grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        for model in self.models:
+            model.allreduce_gradients()
+        timers('grads-all-reduce').stop()
+
+        # All-reduce layer-norm grads (for sequence parallelism).
+        timers('layernorm-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        self.allreduce_layernorm_grads(args)
+        timers('layernorm-grads-all-reduce').stop()
+            
+        # All-reduce embedding grads.
+        if not args.pipeline_no_flushes:
+            timers('embedding-grads-all-reduce', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
+            self.allreduce_embedding_grads(args)
+            timers('embedding-grads-all-reduce').stop()
+
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.
@@ -225,7 +317,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  check_for_nan_in_grad, params_have_main_grad,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models, pipeline_no_flushes):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
@@ -236,6 +328,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self.bf16 = bf16
         self.params_dtype = params_dtype
         self.grad_scaler = grad_scaler
+
+        # weight stashing: 2BW
+        self.pipeline_no_flushes = pipeline_no_flushes
+        self.main_version = 0
+        self.copy_version = 0
+        self.current_model_fp16_version = 0
 
         # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
@@ -284,15 +382,23 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             main_grads, self.found_inf, self.grad_scaler.inv_scale)
 
         # Update across all model parallel instances.
-        torch.distributed.all_reduce(self.found_inf,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=self.get_model_parallel_group())
+        if not self.pipeline_no_flushes:
+            torch.distributed.all_reduce(self.found_inf,
+                                         op=torch.distributed.ReduceOp.MAX,
+                                         group=self.get_model_parallel_group())
 
         # Check for nan.
         found_inf_flag = (self.found_inf.item() > 0)
 
         return found_inf_flag
 
+    def stash(self):
+        '''
+        '''
+
+    def swap(self):
+        '''
+        '''
 
     @torch.no_grad()
     def step(self, args, timers):
@@ -322,20 +428,31 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 return False, None, None
 
         # Clip the main gradients.
-        timers('optimizer-clip-main-grad', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        grad_norm = None
-        if self.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.clip_grad,
-                                            self.check_for_nan_in_grad)
-        timers('optimizer-clip-main-grad').stop()
+        if not args.pipeline_no_flushes:
+            timers('optimizer-clip-main-grad', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
+            grad_norm = None
+            if self.clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm(self.clip_grad,
+                                                self.check_for_nan_in_grad)
+            timers('optimizer-clip-main-grad').stop()
+        else:
+            grad_norm = None
 
         # Count the zeros in the grads.
-        timers('optimizer-count-zeros', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        num_zeros_in_grad = self.count_zeros() if \
-                            self.log_num_zeros_in_grad else None
-        timers('optimizer-count-zeros').stop()
+        if not args.pipeline_no_flushes:
+            timers('optimizer-count-zeros', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
+            num_zeros_in_grad = self.count_zeros() if \
+                                self.log_num_zeros_in_grad else None
+            timers('optimizer-count-zeros').stop()
+
+        else:
+            num_zeros_in_grad = 0
+
+        # weight stashing
+        if args.pipeline_no_flushes:
+            self.stash()
 
         # Step the optimizer.
         timers('optimizer-inner-step', log_level=1).start(
@@ -343,10 +460,17 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
 
+        # weight stashing
+        if args.pipeline_no_flushes:
+            self.main_version += 1
+            self.swap()
+
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         self._copy_main_params_to_model_params()
+        if args.pipeline_no_flushes:
+            self.current_model_fp16_version = self.main_version
         timers('optimizer-copy-main-to-model-params').stop()
 
         # Successful update.
@@ -384,12 +508,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  check_for_nan_in_grad, params_have_main_grad, fp16, bf16,
-                 params_dtype, grad_scaler, models):
+                 params_dtype, grad_scaler, models, pipeline_no_flushes=False):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             check_for_nan_in_grad, params_have_main_grad,
-            fp16, bf16, params_dtype, grad_scaler, models)
+            fp16, bf16, params_dtype, grad_scaler, models, pipeline_no_flushes)
 
         # ======================
         # main parameter stuff
@@ -403,11 +527,20 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         self.fp32_from_float16_groups = []
         self.fp32_from_fp32_groups = []
 
+        # weight stashing: 2BW
+        self.fp32_from_float16_groups_copy = []
+        self.fp32_from_fp32_groups_copy = []
+
         # For all the groups in the original optimizer:
         for param_group in self.optimizer.param_groups:
             float16_params_this_group = []
             fp32_params_this_group = []
             fp32_from_float16_params_this_group = []
+
+            # weight stashing
+            fp32_params_this_group_copy = []
+            fp32_from_float16_params_this_group_copy = []
+
             # For all the parameters in this group:
             for i, param in enumerate(param_group['params']):
                 if param.requires_grad:
@@ -427,6 +560,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         param_group['params'][i] = main_param
 
                         fp32_from_float16_params_this_group.append(main_param)
+                        if self.pipeline_no_flushes:
+                            fp32_from_float16_params_this_group_copy.append(main_param.detach().clone())
+                        else:
+                            fp32_from_float16_params_this_group_copy.append(main_param)
+
                         # Reset existing state dict key to the new main param.
                         if param in self.optimizer.state:
                             self.optimizer.state[main_param] \
@@ -434,6 +572,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
                         fp32_params_this_group.append(param)
+                        if self.pipeline_no_flushes:
+                            fp32_params_this_group_copy.append(param.detach().clone())
+                        else:
+                            fp32_params_this_group_copy.append(param)
+
                         param_group['params'][i] = param
 
                     else:
@@ -448,6 +591,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 fp32_from_float16_params_this_group)
             self.fp32_from_fp32_groups.append(fp32_params_this_group)
 
+            # weight stashing
+            self.fp32_from_float16_groups_copy.append(
+                fp32_from_float16_params_this_group_copy)
+            self.fp32_from_fp32_groups_copy.append(fp32_params_this_group_copy)
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -482,11 +629,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return main_grads
 
 
-    def _get_model_and_main_params_data_float16(self):
+    def _get_model_and_main_params_data_float16(self, from_copy=False):
         model_data = []
         main_data = []
+        if from_copy:
+            fp32_from_float16_groups = self.fp32_from_float16_groups_copy
+        else:
+            fp32_from_float16_groups = self.fp32_from_float16_groups
         for model_group, main_group in zip(self.float16_groups,
-                                           self.fp32_from_float16_groups):
+                                           fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 model_data.append(model_param.data)
                 main_data.append(main_param.data)
@@ -516,9 +667,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     model_param.grad = model_param.main_grad
 
 
-    def _copy_main_params_to_model_params(self):
+    def _copy_main_params_to_model_params(self, from_copy=False):
         # Only needed for the float16 params.
-        model_data, main_data = self._get_model_and_main_params_data_float16()
+        model_data, main_data = self._get_model_and_main_params_data_float16(from_copy=from_copy)
         _multi_tensor_copy_this_to_that(this=main_data, that=model_data,
                                         overflow_buf=self._dummy_overflow_buf)
 
@@ -571,6 +722,39 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
+    def stash(self):
+        for param_groups, param_groups_copy in [
+            (self.fp32_from_float16_groups, self.fp32_from_float16_groups_copy),
+            (self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy),
+        ]:
+            for i, param_group in enumerate(param_groups):
+                for j, param in enumerate(param_group):
+                    param.data.copy_(param_groups_copy[i][j].data)
+        self.main_version = self.copy_version
+
+    def swap(self):
+        for param_groups, param_groups_copy in [
+            (self.fp32_from_float16_groups, self.fp32_from_float16_groups_copy),
+            (self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy),
+        ]:
+            for i, param_group in enumerate(param_groups):
+                for j, param in enumerate(param_group):
+                    param_copy = param.detach().clone()
+                    param.data.copy_(param_groups_copy[i][j].data)
+                    param_groups_copy[i][j].data.copy_(param_copy.data)
+        self.main_version, self.copy_version = self.copy_version, self.main_version
+
+    def swap_to_older_version(self):
+        if self.main_version != self.current_model_fp16_version:
+            self._copy_main_params_to_model_params(from_copy=False)
+            self.current_model_fp16_version = self.main_version
+        # TODO: fixes for fp32 params.
+
+    def swap_to_newer_version(self):
+        if self.copy_version != self.current_model_fp16_version:
+            self._copy_main_params_to_model_params(from_copy=True)
+            self.current_model_fp16_version = self.copy_version
+        # TODO: fixes for fp32 params.
 
 class FP32Optimizer(MegatronOptimizer):
 

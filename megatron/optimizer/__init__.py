@@ -131,7 +131,8 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       args.params_dtype,
                       grad_scaler,
-                      model)
+                      model,
+                      pipeline_no_flushes=args.pipeline_no_flushes)
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,

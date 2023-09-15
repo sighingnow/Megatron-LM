@@ -6,13 +6,23 @@ from typing import Callable, Iterator, List, Optional, Union
 import torch
 from torch.autograd.variable import Variable
 
+from megatron import core
+from megatron import get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
+from megatron.utils import get_rank_rep
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+import nvtx
+
+# from mycolorpy import colorlist as mcp
+# colors = color2=mcp.gen_color(cmap="bwr", n=16)
+forward_colors = [255, 2237183, 4474111, 6711039, 8947967, 11184895, 13421823, 15658751]
+backward_colors = [16711680, 16720418, 16729156, 16737894, 16746632, 16755370, 16764108, 16772846]
 
 
 def get_forward_backward_func():
@@ -89,10 +99,18 @@ def get_forward_backward_func():
     collect_non_loss_data (optional, bool, default=False): TODO
 
     """
+    args = get_args()
+
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+        elif args.pipeline_eager and not args.pipeline_no_flushes:
+            forward_backward_func = forward_backward_pipelining_eager
+        elif args.pipeline_eager and args.pipeline_no_flushes:
+            forward_backward_func = forward_backward_pipelining_eager
+        elif not args.pipeline_eager and args.pipeline_no_flushes:
+            forward_backward_func = forward_backward_pipelining_no_flushes
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
@@ -1047,6 +1065,8 @@ def forward_backward_pipelining_without_interleaving(
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
 
+    args = get_args()
+
     if isinstance(model, list):
         assert (
             len(model) == 1
@@ -1138,6 +1158,8 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    forward_steps, backward_steps = 0, 0
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1150,6 +1172,11 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        if args.profile:
+            # torch.cuda.nvtx.range_push("forward_step")
+            nvtx.push_range('forward-step', color=forward_colors[forward_steps])
+            forward_steps = (forward_steps + 1) % len(forward_colors)
         output_tensor = forward_step(
             forward_step_func,
             data_iterator,
@@ -1161,6 +1188,10 @@ def forward_backward_pipelining_without_interleaving(
             collect_non_loss_data,
             checkpoint_activations_microbatch,
         )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
         send_forward(output_tensor, send_tensor_shapes, config)
 
         if not forward_only:
@@ -1186,6 +1217,10 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        if args.profile:
+            # torch.cuda.nvtx.range_push("forward_step-" + get_rank_rep())
+            nvtx.push_range('forward-step', color=forward_colors[forward_steps])
+            forward_steps = (forward_steps + 1) % len(forward_colors)
         output_tensor = forward_step(
             forward_step_func,
             data_iterator,
@@ -1197,6 +1232,9 @@ def forward_backward_pipelining_without_interleaving(
             collect_non_loss_data,
             checkpoint_activations_microbatch,
         )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, config)
@@ -1225,9 +1263,16 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            if args.profile:
+                # torch.cuda.nvtx.range_push("backward_step-" + get_rank_rep())
+                nvtx.push_range('backward-step', color=backward_colors[backward_steps])
+                backward_steps = (backward_steps + 1) % len(backward_colors)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if args.profile:
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
 
             if last_iteration:
                 input_tensor = None
@@ -1255,9 +1300,16 @@ def forward_backward_pipelining_without_interleaving(
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
+            if args.profile:
+                # torch.cuda.nvtx.range_push("backward_step-" + get_rank_rep())
+                nvtx.push_range('backward-step', color=backward_colors[backward_steps])
+                backward_steps = (backward_steps + 1) % len(backward_colors)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if args.profile:
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
@@ -1277,3 +1329,289 @@ def forward_backward_pipelining_without_interleaving(
         config.finalize_model_grads_func([model])
 
     return forward_data_store
+
+
+input_tensors = []
+output_tensors  = []
+
+
+def forward_backward_pipelining_no_flushes(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    optimizer=None,
+    first_iteration=False,
+    last_iteration=False,
+):
+    """Run 1F1B schedule, with communication and warmup + cooldown microbatches as needed."""
+    if isinstance(model, list):
+        assert (
+            len(model) == 1
+        ), "non-interleaved pipeline parallelism does not support model chunking"
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert (
+            len(data_iterator) == 1
+        ), "non-pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
+
+    assert not forward_only, "'forward_only' not supported for forward_backward_pipelining_no_flushes"
+
+    args = get_args()
+    config = get_model_config(model)
+
+    # Compute number of warmup microbatches.
+    num_warmup_microbatches = (
+        parallel_state.get_pipeline_model_parallel_world_size()
+        - parallel_state.get_pipeline_model_parallel_rank()
+        - 1
+    )
+    num_warmup_microbatches = min(
+        num_warmup_microbatches,
+        num_microbatches)
+    num_cooldown_microbatches = num_warmup_microbatches
+    if last_iteration:
+        num_microbatches_remaining = \
+            num_microbatches - num_warmup_microbatches
+    else:
+        num_microbatches_remaining = num_microbatches
+    num_warmup_microbatches_in_first_iteration = num_warmup_microbatches
+    if not first_iteration:
+        num_warmup_microbatches = 0
+    if not last_iteration:
+        num_cooldown_microbatches = 0
+
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_warmup_microbatches + 1
+
+    model_type = get_model_type(model)
+
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    recv_tensor_shapes = get_tensor_shapes(
+        rank=rank - 1,
+        model_type=model_type,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+    )
+    send_tensor_shapes = get_tensor_shapes(
+        rank=rank,
+        model_type=model_type,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+    )
+
+    # Input, output tensors only need to be saved when doing backward passes
+    # input_tensors = None
+    # output_tensors = None
+    # if not forward_only:
+    #     input_tensors = []
+    #     output_tensors = []
+    global input_tensors, output_tensors
+    forward_data_store = []
+
+    forward_steps, backward_steps = 0, 0
+
+    # Run warmup forward passes.
+    for i in range(num_warmup_microbatches):
+        # Decide to checkpoint all layers' activations of the current micro-batch
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                i % max_outstanding_backprops
+                >= config.num_microbatches_with_partial_activation_checkpoints
+            )
+        else:
+            checkpoint_activations_microbatch = None
+
+        input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        optimizer.swap_to_older_version()
+        if args.profile:
+            # torch.cuda.nvtx.range_push("forward_step-" + get_rank_rep())
+            nvtx.push_range('forward-step', color=forward_colors[forward_steps])
+            forward_steps = (forward_steps + 1) % len(forward_colors)
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+        )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        # Barrier before first receive to measure forward stall.
+        if i == (num_warmup_microbatches - 1):
+            if config.timers:
+                config.timers('forward-pipeline-stall').start()
+            torch.distributed.barrier(group=parallel_state.get_pipeline_model_parallel_group())
+            if config.timers:
+                config.timers('forward-pipeline-stall').stop()
+
+        send_forward(output_tensor, send_tensor_shapes, config)
+
+        input_tensors.append(input_tensor)
+        output_tensors.append(output_tensor)
+        deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+    if first_iteration:
+        # Barrier before first receive to measure forward stall.
+        if num_warmup_microbatches == 0:
+            if config.timers:
+                config.timers('forward-pipeline-stall').start()
+            torch.distributed.barrier(group=parallel_state.get_pipeline_model_parallel_group())
+            if config.timers:
+                config.timers('forward-pipeline-stall').stop()
+
+        # Before running 1F1B, need to receive first forward tensor.
+        # If all microbatches are run in warmup / cooldown phase, then no need to
+        # receive this tensor here.
+        if num_microbatches_remaining > 0:
+            input_tensors.append(recv_forward(recv_tensor_shapes, config))
+
+    # Run 1F1B in steady state.
+    for i in range(num_microbatches_remaining):
+        last_iteration_in_for_loop = (i == (num_microbatches_remaining - 1))
+
+        # Decide to checkpoint all layers' activations of the current micro-batch
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                i % max_outstanding_backprops
+                >= config.num_microbatches_with_partial_activation_checkpoints
+            )
+        else:
+            checkpoint_activations_microbatch = None
+
+        input_tensor = input_tensors[-1]
+        if i < (num_microbatches - num_warmup_microbatches_in_first_iteration):
+            optimizer.swap_to_older_version()
+        else:
+            optimizer.swap_to_newer_version()
+        if args.profile:
+            # torch.cuda.nvtx.range_push("forward_step-" + get_rank_rep())
+            nvtx.push_range('forward-step', color=forward_colors[forward_steps])
+            forward_steps = (forward_steps + 1) % len(forward_colors)
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+        )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        output_tensor_grad = send_forward_recv_backward(
+            output_tensor, send_tensor_shapes, config
+        )
+
+        # Add output_tensor to end of list, then pop from the
+        # start of the list for backward pass.
+        output_tensors.append(output_tensor)
+
+        deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+        input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+
+        optimizer.swap_to_older_version()
+        if args.profile:
+            # torch.cuda.nvtx.range_push("backward_step-" + get_rank_rep())
+            nvtx.push_range('backward-step', color=backward_colors[backward_steps])
+            backward_steps = (backward_steps + 1) % len(backward_colors)
+        input_tensor_grad = \
+            backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        if last_iteration_in_for_loop and last_iteration:
+            input_tensor = None
+            send_backward(input_tensor_grad, recv_tensor_shapes, config)
+        else:
+            input_tensor = send_backward_recv_forward(input_tensor_grad, recv_tensor_shapes, config)
+            input_tensors.append(input_tensor)
+
+    # Run cooldown backward passes.
+    for i in range(num_cooldown_microbatches):
+        input_tensor = input_tensors.pop(0)
+        output_tensor = output_tensors.pop(0)
+
+        output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+        optimizer.swap_to_older_version()
+        if args.profile:
+            # torch.cuda.nvtx.range_push("backward_step-" + get_rank_rep())
+            nvtx.push_range('backward-step', color=backward_colors[backward_steps])
+            backward_steps = (backward_steps + 1) % len(backward_colors)
+        input_tensor_grad = \
+            backward_step(
+                # optimizer, input_tensor, output_tensor,
+                #           output_tensor_grad
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+    return forward_data_store
+
+
+def forward_backward_pipelining_eager(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+):
+    """Run non-interleaved 1F1B schedule, with communication between pipeline
+    stages.
+
+    Returns dictionary with losses if the last stage, empty dict otherwise."""
+
+
+def forward_backward_pipelining_eager_no_flushes(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+):
+    """Run non-interleaved 1F1B schedule, with communication between pipeline
+    stages.
+
+    Returns dictionary with losses if the last stage, empty dict otherwise."""

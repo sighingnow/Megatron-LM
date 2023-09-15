@@ -22,6 +22,7 @@ from megatron import (
 )
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
@@ -238,3 +239,10 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+def get_rank_rep():
+    return '{}-{}-{}'.format(
+        parallel_state.get_data_parallel_rank(),
+        parallel_state.get_pipeline_model_parallel_rank(),
+        parallel_state.get_tensor_model_parallel_rank(),
+    )

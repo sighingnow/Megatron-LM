@@ -39,6 +39,7 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
 from megatron.utils import report_memory
+from megatron.utils import get_rank_rep
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
@@ -278,6 +279,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
+    # Print number of activations per layer
+    if torch.distributed.get_rank() == 0:
+        print(' > number of activations per layer:', flush=True)
+        s = args.seq_length
+        b = args.micro_batch_size
+        h = args.hidden_size
+        t = mpu.get_tensor_model_parallel_world_size()
+        a = args.num_attention_heads
+        activation = s * b * h * 10 + s * b * h * 24 // t + s * b * h * 5 * a * s // (h * t)
+        print('   - activation (forward):', activation, flush=True)
+
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
@@ -400,7 +412,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, iteration):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -411,7 +423,22 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
+    if args.profile:
+        torch.cuda.nvtx.range_push("forward-backward-" + get_rank_rep())
+    timers('forward-backward', log_level=1).start(
+        barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
+
+    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
+    if args.timing_log_level < 2:
+        config.timers = None
+
+    kwargs = dict()
+    if args.pipeline_no_flushes:
+        kwargs['optimizer'] = optimizer
+        kwargs['first_iteration'] = (iteration == args.iteration)
+        kwargs['last_iteration'] = ((iteration + 1) == args.train_iters)
+
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -420,7 +447,15 @@ def train_step(forward_step_func, data_iterator,
         seq_length=args.seq_length,
         micro_batch_size=args.micro_batch_size,
         decoder_seq_length=args.decoder_seq_length,
-        forward_only=False)
+        forward_only=False, **kwargs)
+
+    # reset timers if necessary
+    if config.timers is None:
+        config.timers = timers
+    timers('forward-backward').stop()
+    if args.profile:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -696,7 +731,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
-            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+            # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+
+        if args.profile:
+            torch.cuda.nvtx.range_push("train iteration {}".format(iteration))
 
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
@@ -706,11 +744,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       iteration,
+            )
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
+
+        if args.profile:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
