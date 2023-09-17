@@ -454,7 +454,6 @@ def train_step(forward_step_func, data_iterator,
         config.timers = timers
     timers('forward-backward').stop()
     if args.profile:
-        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
     # Empty unused memory.
@@ -753,7 +752,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        get_num_microbatches()
 
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         # Logging.

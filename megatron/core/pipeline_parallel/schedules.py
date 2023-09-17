@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import functools
 from typing import Callable, Iterator, List, Optional, Union
 
 import torch
@@ -22,7 +23,9 @@ import nvtx
 # from mycolorpy import colorlist as mcp
 # colors = color2=mcp.gen_color(cmap="bwr", n=16)
 forward_colors = [255, 2237183, 4474111, 6711039, 8947967, 11184895, 13421823, 15658751]
+forward_colors = forward_colors + forward_colors
 backward_colors = [16711680, 16720418, 16729156, 16737894, 16746632, 16755370, 16764108, 16772846]
+backward_colors = backward_colors + backward_colors
 
 
 def get_forward_backward_func():
@@ -105,14 +108,13 @@ def get_forward_backward_func():
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
-        elif args.pipeline_eager and not args.pipeline_no_flushes:
-            forward_backward_func = forward_backward_pipelining_eager
-        elif args.pipeline_eager and args.pipeline_no_flushes:
-            forward_backward_func = forward_backward_pipelining_eager
-        elif not args.pipeline_eager and args.pipeline_no_flushes:
-            forward_backward_func = forward_backward_pipelining_no_flushes
         else:
-            forward_backward_func = forward_backward_pipelining_without_interleaving
+            if args.pipeline_no_flushes:
+                forward_backward_func = forward_backward_pipelining_no_flushes
+            else:
+                forward_backward_func = forward_backward_pipelining_without_interleaving
+            if args.pipeline_eager:
+                forward_backward_func = functools.partial(forward_backward_func, eager=True)
     else:
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
@@ -980,6 +982,18 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+def wait_async_p2p(handlers):
+    if not handlers:
+        return
+    if not isinstance(handlers, list):
+        handlers = [handlers]
+    for handler in handlers:
+        if isinstance(handler, list):
+            wait_async_p2p(handler)
+        else:
+            handler.wait()
+
+
 def recv_forward(tensor_shapes, config):
     input_tensors = []
     for tensor_shape in tensor_shapes:
@@ -988,6 +1002,20 @@ def recv_forward(tensor_shapes, config):
         else:
             input_tensors.append(p2p_communication.recv_forward(tensor_shape, config))
     return input_tensors
+
+def recv_forward_async(tensor_shapes, config):
+    input_tensors, wait_handlers = [], []
+    for tensor_shape in tensor_shapes:
+        if tensor_shape is None:
+            input_tensors.append(None)
+        else:
+            tensor, handlers = p2p_communication.recv_forward(
+                tensor_shape, config, overlap_p2p_comm=True
+            )
+            input_tensors.append(tensor)
+            if handlers:
+                wait_handlers.extend(handlers)
+    return input_tensors, wait_handlers
 
 
 def recv_backward(tensor_shapes, config):
@@ -999,6 +1027,17 @@ def recv_backward(tensor_shapes, config):
             output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape, config))
     return output_tensor_grads
 
+def recv_backward_async(tensor_shapes, config):
+    output_tensor_grads, wait_handlers = [], []
+    for tensor_shape in tensor_shapes:
+        if tensor_shape is None:
+            output_tensor_grads.append(None)
+        else:
+            tensor, handlers = p2p_communication.recv_backward(tensor_shape, config)
+            output_tensor_grads.append(tensor)
+            wait_handlers.extend(handlers)
+    return output_tensor_grads, wait_handlers
+
 
 def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
@@ -1008,6 +1047,18 @@ def send_forward(output_tensors, tensor_shapes, config):
             continue
         p2p_communication.send_forward(output_tensor, config)
 
+def send_forward_async(output_tensors, tensor_shapes, config):
+    if not isinstance(output_tensors, list):
+        output_tensors = [output_tensors]
+    wait_handlers = []
+    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+        if tensor_shape is None:
+            continue
+        hanlders = p2p_communication.send_forward(output_tensor, config)
+        if hanlders:
+            wait_handlers.extend(hanlders)
+    return wait_handlers
+
 
 def send_backward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
@@ -1016,6 +1067,18 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
         if tensor_shape is None:
             continue
         p2p_communication.send_backward(input_tensor_grad, config)
+
+def send_backward_async(input_tensor_grads, tensor_shapes, config):
+    if not isinstance(input_tensor_grads, list):
+        input_tensor_grads = [input_tensor_grads]
+    wait_handlers = []
+    for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
+        if tensor_shape is None:
+            continue
+        handlers = p2p_communication.send_backward(input_tensor_grad, config)
+        if handlers:
+            wait_handlers.extend(handlers)
+    return wait_handlers
 
 
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
@@ -1059,6 +1122,7 @@ def forward_backward_pipelining_without_interleaving(
     decoder_seq_length: int = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
+    eager=False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
@@ -1077,6 +1141,9 @@ def forward_backward_pipelining_without_interleaving(
             len(data_iterator) == 1
         ), "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
+    assert (
+        not (forward_only and eager)
+    ), "'forward_only' not supported for eager-1F1B pipeline scheduling"
 
     config = get_model_config(model)
     if config.overlap_p2p_comm:
@@ -1115,7 +1182,11 @@ def forward_backward_pipelining_without_interleaving(
         - parallel_state.get_pipeline_model_parallel_rank()
         - 1
     )
+    num_warmup_microbatches_non_eager = num_warmup_microbatches
+    if eager:
+        num_warmup_microbatches *= 2
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+    num_warmup_microbatches_non_eager = min(num_warmup_microbatches_non_eager, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -1160,6 +1231,10 @@ def forward_backward_pipelining_without_interleaving(
 
     forward_steps, backward_steps = 0, 0
 
+    # for eager 1F1B
+    send_wait_handlers = []
+    recv_input_tensor, recv_wait_handlers = None, None
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1189,10 +1264,13 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch,
         )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
-        send_forward(output_tensor, send_tensor_shapes, config)
+        if not eager or i <= num_warmup_microbatches_non_eager:
+            send_forward(output_tensor, send_tensor_shapes, config)
+        else:
+            hanlders = send_forward_async(output_tensor, send_tensor_shapes, config)
+            send_wait_handlers.append(hanlders)
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -1202,8 +1280,12 @@ def forward_backward_pipelining_without_interleaving(
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
+    input_tensor = None
     if num_microbatches_remaining > 0:
         input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        if eager and num_microbatches_remaining > 1:
+            recv_input_tensor, recv_wait_handlers = recv_forward_async(recv_tensor_shapes, config)
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -1233,7 +1315,6 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch,
         )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if forward_only:
@@ -1243,9 +1324,18 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = recv_forward(recv_tensor_shapes, config)
 
         else:
-            output_tensor_grad = send_forward_recv_backward(
-                output_tensor, send_tensor_shapes, config
-            )
+            if not eager:
+                output_tensor_grad = send_forward_recv_backward(
+                    output_tensor, send_tensor_shapes, config
+                )
+            else:
+                # recv backward first, then we can start the computation
+                output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+                if send_wait_handlers:
+                    wait_async_p2p(send_wait_handlers.pop(0))
+                hanlders = send_forward_async(output_tensor, send_tensor_shapes, config)
+                send_wait_handlers.append(hanlders)
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
@@ -1271,16 +1361,29 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
             if args.profile:
-                torch.cuda.synchronize()
                 torch.cuda.nvtx.range_pop()
 
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, config)
             else:
-                input_tensor = send_backward_recv_forward(
-                    input_tensor_grad, recv_tensor_shapes, config
-                )
+                if not eager:
+                    input_tensor = send_backward_recv_forward(
+                        input_tensor_grad, recv_tensor_shapes, config
+                    )
+                else:
+                    # send backward first then the previous rank can start backward computation
+                    send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+                    # try use the async recieved input tensor first
+                    if recv_wait_handlers:
+                        wait_async_p2p(recv_wait_handlers)
+                        input_tensor, recv_wait_handlers = recv_input_tensor, None
+                    # issue the next async recieve, if there are any
+                    if i + 2 < num_microbatches_remaining:
+                        recv_input_tensor, recv_wait_handlers = recv_forward_async(
+                            recv_tensor_shapes, config
+                        )
 
     # Run cooldown backward passes.
     if not forward_only:
@@ -1308,10 +1411,13 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
             if args.profile:
-                torch.cuda.synchronize()
                 torch.cuda.nvtx.range_pop()
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+            # wait pending inputs
+            if send_wait_handlers:
+                wait_async_p2p(send_wait_handlers.pop(0))
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -1334,6 +1440,9 @@ def forward_backward_pipelining_without_interleaving(
 input_tensors = []
 output_tensors  = []
 
+# for eager 1F1B
+send_wait_handlers = []
+recv_input_tensor, recv_wait_handlers = None, None
 
 def forward_backward_pipelining_no_flushes(
     *,
@@ -1346,6 +1455,7 @@ def forward_backward_pipelining_no_flushes(
     decoder_seq_length: int = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
+    eager=False,
     optimizer=None,
     first_iteration=False,
     last_iteration=False,
@@ -1362,7 +1472,28 @@ def forward_backward_pipelining_no_flushes(
         ), "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
 
-    assert not forward_only, "'forward_only' not supported for forward_backward_pipelining_no_flushes"
+    assert (
+        not forward_only
+    ), "'forward_only' not supported for forward_backward_pipelining_no_flushes"
+
+    if eager:
+        assert (
+            parallel_state.get_pipeline_model_parallel_world_size() < num_microbatches
+        ), (
+            "Eager 1F1B + Pipedream 2BW (no flushes) cannot work with cases where "
+            + "the depth of pipeline parallelism is larger than or equal to the number "
+            + "of micro-batches.",
+        )
+    # the implementation is referred from pipedream-2bw:
+    # https://github.com/msr-fiddle/pipedream/tree/pipedream_2bw
+    #
+    # for cases where pipeline parallelism depths is less than the number of
+    # microbatches, it is impossbile to generate such a correct scheduling plan.
+    assert parallel_state.get_pipeline_model_parallel_rank() <= num_microbatches, (
+        "Pipedream 2BW (no flushes) cannot work with cases where "
+        + "the depth of pipeline parallelism is larger than the number "
+        + "of micro-batches."
+    )
 
     args = get_args()
     config = get_model_config(model)
@@ -1373,6 +1504,10 @@ def forward_backward_pipelining_no_flushes(
         - parallel_state.get_pipeline_model_parallel_rank()
         - 1
     )
+    num_warmup_microbatches_non_eager = num_warmup_microbatches
+    if eager:
+        num_warmup_microbatches *= 2
+    num_warmup_microbatches_non_eager = min(num_warmup_microbatches_non_eager, num_microbatches)
     num_warmup_microbatches = min(
         num_warmup_microbatches,
         num_microbatches)
@@ -1423,6 +1558,10 @@ def forward_backward_pipelining_no_flushes(
 
     forward_steps, backward_steps = 0, 0
 
+    # for eager 1F1B
+    global send_wait_handlers
+    global recv_input_tensor, recv_wait_handlers
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1453,18 +1592,23 @@ def forward_backward_pipelining_no_flushes(
             checkpoint_activations_microbatch,
         )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         # Barrier before first receive to measure forward stall.
-        if i == (num_warmup_microbatches - 1):
+        #
+        # eager: the barrier cannot be reached
+        if not args.profile and not eager and (i == (num_warmup_microbatches - 1)):
             if config.timers:
                 config.timers('forward-pipeline-stall').start()
             torch.distributed.barrier(group=parallel_state.get_pipeline_model_parallel_group())
             if config.timers:
                 config.timers('forward-pipeline-stall').stop()
 
-        send_forward(output_tensor, send_tensor_shapes, config)
+        if not eager or i <= num_warmup_microbatches_non_eager:
+            send_forward(output_tensor, send_tensor_shapes, config)
+        else:
+            hanlders = send_forward_async(output_tensor, send_tensor_shapes, config)
+            send_wait_handlers.append(hanlders)
 
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
@@ -1472,18 +1616,20 @@ def forward_backward_pipelining_no_flushes(
 
     if first_iteration:
         # Barrier before first receive to measure forward stall.
-        if num_warmup_microbatches == 0:
+        if not args.profile and not eager and num_warmup_microbatches == 0:
             if config.timers:
                 config.timers('forward-pipeline-stall').start()
             torch.distributed.barrier(group=parallel_state.get_pipeline_model_parallel_group())
             if config.timers:
                 config.timers('forward-pipeline-stall').stop()
 
-        # Before running 1F1B, need to receive first forward tensor.
-        # If all microbatches are run in warmup / cooldown phase, then no need to
-        # receive this tensor here.
+        # Before running 1F1B, need to receive first forward tensor, if all microbatches
+        # are run in warmup / cooldown phase, then no need to receive this tensor here.
         if num_microbatches_remaining > 0:
             input_tensors.append(recv_forward(recv_tensor_shapes, config))
+
+            if eager and num_microbatches_remaining > 1:
+                recv_input_tensor, recv_wait_handlers = recv_forward_async(recv_tensor_shapes, config)
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -1519,12 +1665,20 @@ def forward_backward_pipelining_no_flushes(
             checkpoint_activations_microbatch,
         )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
-        output_tensor_grad = send_forward_recv_backward(
-            output_tensor, send_tensor_shapes, config
-        )
+        if not eager:
+            output_tensor_grad = send_forward_recv_backward(
+                output_tensor, send_tensor_shapes, config
+            )
+        else:
+            # recv backward first, then we can start the computation
+            output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            if send_wait_handlers:
+                wait_async_p2p(send_wait_handlers.pop(0))
+            hanlders = send_forward_async(output_tensor, send_tensor_shapes, config)
+            send_wait_handlers.append(hanlders)
 
         # Add output_tensor to end of list, then pop from the
         # start of the list for backward pass.
@@ -1544,14 +1698,29 @@ def forward_backward_pipelining_no_flushes(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if last_iteration_in_for_loop and last_iteration:
             input_tensor = None
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
         else:
-            input_tensor = send_backward_recv_forward(input_tensor_grad, recv_tensor_shapes, config)
+            if not eager:
+                input_tensor = send_backward_recv_forward(
+                    input_tensor_grad, recv_tensor_shapes, config
+                )
+            else:
+                # send backward first then the previous rank can start backward computation
+                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+                # try use the async recieved input tensor first
+                if recv_wait_handlers:
+                    wait_async_p2p(recv_wait_handlers)
+                    input_tensor, recv_wait_handlers = recv_input_tensor, None
+                # issue the next async recieve, if there are any
+                if not last_iteration or i + 2 < num_microbatches_remaining:
+                    recv_input_tensor, recv_wait_handlers = recv_forward_async(
+                        recv_tensor_shapes, config
+                    )
             input_tensors.append(input_tensor)
 
     # Run cooldown backward passes.
@@ -1573,45 +1742,12 @@ def forward_backward_pipelining_no_flushes(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
         if args.profile:
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
+        # wait pending inputs
+        if send_wait_handlers:
+            wait_async_p2p(send_wait_handlers.pop(0))
+
     return forward_data_store
-
-
-def forward_backward_pipelining_eager(
-    *,
-    forward_step_func,
-    data_iterator: Union[Iterator, List[Iterator]],
-    model: Union[torch.nn.Module, List[torch.nn.Module]],
-    num_microbatches: int,
-    seq_length: int,
-    micro_batch_size: int,
-    decoder_seq_length: int = None,
-    forward_only: bool = False,
-    collect_non_loss_data: bool = False,
-):
-    """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages.
-
-    Returns dictionary with losses if the last stage, empty dict otherwise."""
-
-
-def forward_backward_pipelining_eager_no_flushes(
-    *,
-    forward_step_func,
-    data_iterator: Union[Iterator, List[Iterator]],
-    model: Union[torch.nn.Module, List[torch.nn.Module]],
-    num_microbatches: int,
-    seq_length: int,
-    micro_batch_size: int,
-    decoder_seq_length: int = None,
-    forward_only: bool = False,
-    collect_non_loss_data: bool = False,
-):
-    """Run non-interleaved 1F1B schedule, with communication between pipeline
-    stages.
-
-    Returns dictionary with losses if the last stage, empty dict otherwise."""

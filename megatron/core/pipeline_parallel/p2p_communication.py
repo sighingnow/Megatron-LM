@@ -347,7 +347,11 @@ def _communicate(
     return tensor_recv_prev, tensor_recv_next, reqs
 
 
-def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+def recv_forward(
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
+) -> torch.Tensor:
     """ Receive tensor from previous rank in pipeline (forward receive).
 
 
@@ -356,46 +360,62 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
 
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        wait_handles = None
     else:
         if config.timers is not None:
             config.timers('forward-recv', log_level=2).start()
-        input_tensor, _, _ = _communicate(
+        input_tensor, _, wait_handles = _communicate(
             tensor_send_next=None,
             tensor_send_prev=None,
             recv_prev=True,
             recv_next=False,
             tensor_shape=tensor_shape,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('forward-recv').stop()
+    if overlap_p2p_comm:
+        return input_tensor, wait_handles
     return input_tensor
 
 
-def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+def recv_backward(
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
+) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
     See _communicate for argument details.
     """
     if core.parallel_state.is_pipeline_last_stage():
         output_tensor_grad = None
+        wait_handles = None
     else:
         if config.timers is not None:
             config.timers('backward-recv', log_level=2).start()
-        _, output_tensor_grad, _ = _communicate(
+        _, output_tensor_grad, wait_handles = _communicate(
             tensor_send_next=None,
             tensor_send_prev=None,
             recv_prev=False,
             recv_next=True,
             tensor_shape=tensor_shape,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('backward-recv').stop()
+    if overlap_p2p_comm:
+        return output_tensor_grad, wait_handles
     return output_tensor_grad
 
 
-def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> None:
+def send_forward(
+    output_tensor: torch.Tensor,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
+) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
     See _communicate for argument details.
@@ -404,19 +424,26 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     if not core.parallel_state.is_pipeline_last_stage():
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
-        _communicate(
+        _, _, wait_handles = _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
             recv_prev=False,
             recv_next=False,
             tensor_shape=None,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('forward-send').stop()
+        return wait_handles
+    return None
 
 
-def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) -> None:
+def send_backward(
+    input_tensor_grad: torch.Tensor,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
+) -> None:
     """Send tensor to previous rank in pipeline (backward send).
 
     See _communicate for argument details.
@@ -424,20 +451,26 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
     if not core.parallel_state.is_pipeline_first_stage():
         if config.timers is not None:
             config.timers('backward-send', log_level=2).start()
-        _communicate(
+        _, _, wait_handles = _communicate(
             tensor_send_next=None,
             tensor_send_prev=input_tensor_grad,
             recv_prev=False,
             recv_next=False,
             tensor_shape=None,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('backward-send').stop()
+        return wait_handles
+    return None
 
 
 def send_forward_recv_backward(
-    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    output_tensor: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
 ) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
@@ -445,24 +478,31 @@ def send_forward_recv_backward(
     """
     if core.parallel_state.is_pipeline_last_stage():
         output_tensor_grad = None
+        wait_handles = None
     else:
         if config.timers is not None:
             config.timers('forward-send-backward-recv', log_level=2).start()
-        _, output_tensor_grad, _ = _communicate(
+        _, output_tensor_grad, wait_handles = _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
             recv_prev=False,
             recv_next=True,
             tensor_shape=tensor_shape,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('forward-send-backward-recv').stop()
+    if overlap_p2p_comm:
+        return output_tensor_grad, wait_handles
     return output_tensor_grad
 
 
 def send_backward_recv_forward(
-    input_tensor_grad: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    input_tensor_grad: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    overlap_p2p_comm: bool = False,
 ) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 
@@ -470,19 +510,23 @@ def send_backward_recv_forward(
     """
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        wait_handles = None
     else:
         if config.timers is not None:
             config.timers('backward-send-forward-recv', log_level=2).start()
-        input_tensor, _, _ = _communicate(
+        input_tensor, _, wait_handles = _communicate(
             tensor_send_next=None,
             tensor_send_prev=input_tensor_grad,
             recv_prev=True,
             recv_next=False,
             tensor_shape=tensor_shape,
+            wait_on_reqs=(not overlap_p2p_comm),
             config=config,
         )
         if config.timers is not None:
             config.timers('backward-send-forward-recv').stop()
+    if overlap_p2p_comm:
+        return input_tensor, wait_handles
     return input_tensor
 
 
