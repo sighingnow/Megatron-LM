@@ -562,8 +562,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         fp32_from_float16_params_this_group.append(main_param)
                         if self.pipeline_no_flushes:
                             fp32_from_float16_params_this_group_copy.append(main_param.detach().clone())
-                        else:
-                            fp32_from_float16_params_this_group_copy.append(main_param)
 
                         # Reset existing state dict key to the new main param.
                         if param in self.optimizer.state:
@@ -574,8 +572,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         fp32_params_this_group.append(param)
                         if self.pipeline_no_flushes:
                             fp32_params_this_group_copy.append(param.detach().clone())
-                        else:
-                            fp32_params_this_group_copy.append(param)
 
                         param_group['params'][i] = param
 
@@ -595,6 +591,22 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.fp32_from_float16_groups_copy.append(
                 fp32_from_float16_params_this_group_copy)
             self.fp32_from_fp32_groups_copy.append(fp32_params_this_group_copy)
+
+        if self.pipeline_no_flushes:
+            extra_params_fp16, extra_params_fp32 = 0, 0
+            for group in self.fp32_from_float16_groups_copy:
+                for param in group:
+                    extra_params_fp16 += param.numel()
+            for group in self.fp32_from_fp32_groups_copy:
+                for param in group:
+                    extra_params_fp32 += param.numel()
+            mega_bytes = 1024.0 * 1024.0
+            print("[Rank {}] Pipedream-2BW requires {} fp32_from_fp16 and {} fp32, extra {} (MB) memory".format(
+                torch.distributed.get_rank(),
+                extra_params_fp16,
+                extra_params_fp32,
+                (extra_params_fp16 * 4 + extra_params_fp32 * 4) / mega_bytes
+            ), flush=True)
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -687,6 +699,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if self.grad_scaler:
             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
         state_dict['fp32_from_fp16_params'] = self.fp32_from_float16_groups
+
+        if self.pipeline_no_flushes:
+            state_dict['main_version'] = self.main_version
+            state_dict['copy_version'] = self.copy_version
+            state_dict['fp32_from_fp16_params_copy'] = self.fp32_from_float16_groups_copy
+            state_dict['fp32_from_fp32_params_copy'] = self.fp32_from_fp32_groups_copy
         return state_dict
 
 
@@ -721,6 +739,25 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 state_dict[fp32_from_float16_params_key]):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
+
+        if self.pipeline_no_flushes:
+            self.main_version = state_dict.get('main_version', 0)
+            self.copy_version = state_dict.get('copy_version', 0)
+            if 'fp32_from_fp16_params_copy' in state_dict and \
+                    'fp32_from_fp32_params_copy' in state_dict:
+                for current_groups, saved_groups in zip(
+                    [self.fp32_from_float16_groups_copy, state_dict['fp32_from_fp16_params_copy']],
+                    [self.fp32_from_fp32_groups_copy, state_dict['fp32_from_fp32_params_copy']]):
+                    for current_group, saved_group in zip(current_groups, saved_groups):
+                        for current_param, saved_param in zip(current_group, saved_group):
+                            current_param.data.copy_(saved_param.data)
+            else:
+                for param_groups, param_groups_copy in [
+                    [self.fp32_from_float16_groups, self.fp32_from_float16_groups_copy],
+                    [self.fp32_from_fp32_groups, self.fp32_from_fp32_groups_copy]]:
+                    for i, param_group in enumerate(param_groups):
+                        for j, param in enumerate(param_group):
+                            param_groups_copy[i][j].data.copy_(param.data)
 
     def stash(self):
         for param_groups, param_groups_copy in [

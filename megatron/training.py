@@ -145,6 +145,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     if not args.skip_train:
         print_rank_0('training ...')
+        report_memory('start training')
 
         if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
             args.train_iters = args.retro_cyclic_train_iters
@@ -158,6 +159,7 @@ def pretrain(train_valid_test_dataset_provider,
                               process_non_loss_data_func, config)
 
         print_datetime('after training is done')
+        report_memory('after training is done')
 
         if args.save and iteration != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -281,23 +283,33 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Print number of activations per layer
     if torch.distributed.get_rank() == 0:
-        print(' > number of activations per layer:', flush=True)
+        mega_bytes = 1024.0 * 1024.0
         s = args.seq_length
         b = args.micro_batch_size
         h = args.hidden_size
         t = mpu.get_tensor_model_parallel_world_size()
         a = args.num_attention_heads
-        activation = s * b * h * 10 + s * b * h * 24 // t + s * b * h * 5 * a * s // (h * t)
-        print('   - activation (forward):', activation, flush=True)
+        L = args.num_layers
+
+        activation = s * b * h * 10 + s * b * h * 24 / t + s * b * h * 5 * a * s / (h * t)
+        print(f' > memory size for activations per layer:', flush=True)
+        print(f'   - activation (forward): {activation / mega_bytes} (MB)', flush=True)
+
+        activation_first_stage = s * b * h * L / t * (34 + 5 * a * s / h)
+        print(f' > memory size for activations for the first stage:', flush=True)
+        print(f'   - activation (forward): {activation_first_stage / mega_bytes} (MB)', flush=True)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
+        mega_bytes = 1024.0 * 1024.0
+        num_parameters = sum(
+            [sum([p.nelement() for p in model_module.parameters()])
+             for model_module in model])
         print(' > number of parameters on (tensor, pipeline) '
-              'model parallel rank ({}, {}): {}'.format(
+              'model parallel rank ({}, {}): {}, estimated memory: {} (MB)'.format(
             mpu.get_tensor_model_parallel_rank(),
             mpu.get_pipeline_model_parallel_rank(),
-            sum([sum([p.nelement() for p in model_module.parameters()])
-                 for model_module in model])), flush=True)
+            num_parameters, num_parameters * 16 / mega_bytes), flush=True)
 
     # GPU allocation.
     for model_module in model:
