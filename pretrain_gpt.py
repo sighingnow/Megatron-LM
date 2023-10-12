@@ -14,18 +14,13 @@ from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import GPTDataset, build_train_valid_test_datasets
 import megatron.model
-from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import (
-    gpt_layer_with_transformer_engine_spec,
-    gpt_layer_with_transformer_engine_spec_moe
-)
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> megatron.model.GPTModel:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -44,6 +39,12 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     config = core_transformer_config_from_args(get_args())
 
     if args.use_mcore_models:
+        from megatron.core.models.gpt import GPTModel
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            gpt_layer_with_transformer_engine_spec,
+            gpt_layer_with_transformer_engine_spec_moe
+        )
+
         if args.model_spec is not None:
             transformer_layer_spec = import_module(args.model_spec)
         else:
@@ -134,7 +135,7 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     return loss, {'lm loss': averaged_loss[0]}
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: megatron.model.GPTModel):
     """Forward training step.
 
     Args:

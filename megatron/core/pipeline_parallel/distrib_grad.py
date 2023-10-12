@@ -3,6 +3,7 @@
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron import get_args
 from megatron.core import mpu
 from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
@@ -107,6 +108,7 @@ def finalize_model_grads(model):
     for sequence parallelism, and embedding grads across first and
     last pipeline stages (if not tied)."""
 
+    args = get_args()
     config = get_model_config(model[0])
 
     # All-reduce / reduce-scatter across DP replicas.
@@ -125,6 +127,10 @@ def finalize_model_grads(model):
     _allreduce_layernorm_grads(model, config)
     if config.timers is not None:
         config.timers('layernorm-grads-all-reduce').stop()
+
+    # pipeline no flushes: skip all-reduce embedding grads and expert grads
+    if args.pipeline_no_flushes:
+        return
 
     # All-reduce embedding grads.
     if config.timers is not None:
