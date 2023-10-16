@@ -3,9 +3,11 @@
 import contextlib
 import functools
 from typing import Callable, Iterator, List, Optional, Union
+import os
 
 import torch
 from torch.autograd.variable import Variable
+from torch.distributed.elastic import timer as torch_elastic_timer
 
 from megatron import core
 from megatron import get_args
@@ -994,6 +996,20 @@ def wait_async_p2p(handlers):
             handler.wait()
 
 
+timeout_enabled = int(os.environ.get('TORCHELASTIC_TIMEOUT', '0')) != 0
+
+
+def timeout_guard(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with torch_elastic_timer.expires(10):
+            return fn(*args, **kwargs)
+    if timeout_enabled:
+        return wrapper
+    return fn
+
+
+@timeout_guard
 def recv_forward(tensor_shapes, config):
     input_tensors = []
     for tensor_shape in tensor_shapes:
@@ -1018,6 +1034,7 @@ def recv_forward_async(tensor_shapes, config):
     return input_tensors, wait_handlers
 
 
+@timeout_guard
 def recv_backward(tensor_shapes, config):
     output_tensor_grads = []
     for tensor_shape in tensor_shapes:
@@ -1039,6 +1056,7 @@ def recv_backward_async(tensor_shapes, config):
     return output_tensor_grads, wait_handlers
 
 
+@timeout_guard
 def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1060,6 +1078,7 @@ def send_forward_async(output_tensors, tensor_shapes, config):
     return wait_handlers
 
 
+@timeout_guard
 def send_backward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
@@ -1081,6 +1100,7 @@ def send_backward_async(input_tensor_grads, tensor_shapes, config):
     return wait_handlers
 
 
+@timeout_guard
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1096,6 +1116,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     return output_tensor_grads
 
 
+@timeout_guard
 def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]

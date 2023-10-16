@@ -4,11 +4,15 @@
 
 from datetime import datetime
 import math
+import os
 import sys
 import time
+import multiprocessing as mp
+
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import torch.distributed.elastic.timer as torch_elastic_timer
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -106,6 +110,17 @@ def pretrain(train_valid_test_dataset_provider,
 
     args = get_args()
     timers = get_timers()
+
+    # setup torch elastic timer for timeout detection
+    timer_path = os.environ.get('TORCHELASTIC_TIMER_FILE', None)
+    timer_server = None
+    if timer_path:
+        torch_elastic_timer.configure(torch_elastic_timer.FileTimerClient(timer_path))
+    else:
+        message_queue = mp.Queue()
+        timer_server = torch_elastic_timer.LocalTimerServer(message_queue)
+        timer_server.start()
+        torch_elastic_timer.configure(torch_elastic_timer.LocalTimerClient(message_queue))
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
