@@ -2,6 +2,7 @@
 
 """Megatron initialization."""
 
+from datetime import datetime
 import random
 import os
 import time
@@ -192,6 +193,7 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
+        start_time = time.time()
         # Call the init process
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
@@ -199,6 +201,12 @@ def _initialize_distributed():
             rank=args.rank,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
         )
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print('> torch.distributed.init_process_group() uses %s seconds, at %s' % (
+                time.time() - start_time,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            ))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

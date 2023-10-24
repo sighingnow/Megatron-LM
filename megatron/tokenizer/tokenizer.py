@@ -4,12 +4,15 @@
 
 from abc import ABC
 from abc import abstractmethod
+from datetime import datetime
+import time
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 def build_tokenizer(args):
     """Initialize tokenizer."""
+    start_time = time.time()
     if args.rank == 0:
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
@@ -50,6 +53,12 @@ def build_tokenizer(args):
         args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                           args)
 
+    if args.rank == 0:
+            print('> building {} tokenizer uses {} seconds, at {}'.format(
+                args.tokenizer_type,
+                time.time() - start_time,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            ))
     return tokenizer
 
 
